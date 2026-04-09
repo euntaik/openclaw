@@ -781,7 +781,7 @@ export async function runMessageAction(
     mediaSources: collectActionMediaSourceHints(params),
     sessionKey: input.sessionKey,
     messageProvider: input.sessionKey ? undefined : channel,
-    accountId: input.sessionKey ? input.requesterAccountId : accountId,
+    accountId: input.sessionKey ? (input.requesterAccountId ?? accountId) : accountId,
     requesterSenderId: input.requesterSenderId,
   });
   const mediaPolicy = resolveAttachmentMediaPolicy({
