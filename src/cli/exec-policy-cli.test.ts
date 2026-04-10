@@ -1,0 +1,218 @@
+import { Command } from "commander";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { OpenClawConfig } from "../config/config.js";
+import type { ExecApprovalsFile } from "../infra/exec-approvals.js";
+import { registerExecPolicyCli } from "./exec-policy-cli.js";
+
+const mocks = vi.hoisted(() => {
+  const runtimeErrors: string[] = [];
+  const stringifyArgs = (args: unknown[]) => args.map((value) => String(value)).join(" ");
+  let configState: OpenClawConfig = {
+    tools: {
+      exec: {
+        host: "auto",
+        security: "allowlist",
+        ask: "on-miss",
+      },
+    },
+  };
+  let approvalsState: ExecApprovalsFile = {
+    version: 1,
+    defaults: {
+      security: "allowlist",
+      ask: "on-miss",
+      askFallback: "deny",
+    },
+    agents: {},
+  };
+  const defaultRuntime = {
+    log: vi.fn(),
+    error: vi.fn((...args: unknown[]) => {
+      runtimeErrors.push(stringifyArgs(args));
+    }),
+    writeJson: vi.fn((value: unknown, space = 2) => {
+      defaultRuntime.log(JSON.stringify(value, null, space > 0 ? space : undefined));
+    }),
+    exit: vi.fn((code: number) => {
+      throw new Error(`__exit__:${code}`);
+    }),
+  };
+  return {
+    getConfig: () => configState,
+    setConfig: (next: OpenClawConfig) => {
+      configState = next;
+    },
+    getApprovals: () => approvalsState,
+    setApprovals: (next: ExecApprovalsFile) => {
+      approvalsState = next;
+    },
+    defaultRuntime,
+    runtimeErrors,
+    mutateConfigFile: vi.fn(async ({ mutate }: { mutate: (draft: OpenClawConfig) => void }) => {
+      const draft = structuredClone(configState);
+      mutate(draft);
+      configState = draft;
+      return {
+        path: "/tmp/openclaw.json",
+        previousHash: "hash-1",
+        snapshot: { path: "/tmp/openclaw.json" },
+        nextConfig: draft,
+        result: undefined,
+      };
+    }),
+    readConfigFileSnapshot: vi.fn(async () => ({
+      path: "/tmp/openclaw.json",
+      config: configState,
+    })),
+    readExecApprovalsSnapshot: vi.fn(() => ({
+      path: "/tmp/exec-approvals.json",
+      exists: true,
+      raw: "{}",
+      hash: "approvals-hash",
+      file: approvalsState,
+    })),
+    saveExecApprovals: vi.fn((file: ExecApprovalsFile) => {
+      approvalsState = file;
+    }),
+  };
+});
+
+vi.mock("../runtime.js", () => ({
+  defaultRuntime: mocks.defaultRuntime,
+}));
+
+vi.mock("../config/config.js", async () => {
+  const actual = await vi.importActual<typeof import("../config/config.js")>("../config/config.js");
+  return {
+    ...actual,
+    mutateConfigFile: mocks.mutateConfigFile,
+    readConfigFileSnapshot: mocks.readConfigFileSnapshot,
+  };
+});
+
+vi.mock("../infra/exec-approvals.js", async () => {
+  const actual = await vi.importActual<typeof import("../infra/exec-approvals.js")>(
+    "../infra/exec-approvals.js",
+  );
+  return {
+    ...actual,
+    readExecApprovalsSnapshot: mocks.readExecApprovalsSnapshot,
+    saveExecApprovals: mocks.saveExecApprovals,
+  };
+});
+
+describe("exec-policy CLI", () => {
+  const createProgram = () => {
+    const program = new Command();
+    program.exitOverride();
+    registerExecPolicyCli(program);
+    return program;
+  };
+
+  const runExecPolicyCommand = async (args: string[]) => {
+    const program = createProgram();
+    await program.parseAsync(args, { from: "user" });
+  };
+
+  beforeEach(() => {
+    mocks.setConfig({
+      tools: {
+        exec: {
+          host: "auto",
+          security: "allowlist",
+          ask: "on-miss",
+        },
+      },
+    });
+    mocks.setApprovals({
+      version: 1,
+      defaults: {
+        security: "allowlist",
+        ask: "on-miss",
+        askFallback: "deny",
+      },
+      agents: {},
+    });
+    mocks.runtimeErrors.length = 0;
+    mocks.defaultRuntime.log.mockClear();
+    mocks.defaultRuntime.error.mockClear();
+    mocks.defaultRuntime.writeJson.mockClear();
+    mocks.defaultRuntime.exit.mockClear();
+    mocks.mutateConfigFile.mockClear();
+    mocks.readConfigFileSnapshot.mockClear();
+    mocks.readExecApprovalsSnapshot.mockClear();
+    mocks.saveExecApprovals.mockClear();
+  });
+
+  it("shows the local merged exec policy as json", async () => {
+    await runExecPolicyCommand(["exec-policy", "show", "--json"]);
+
+    expect(mocks.defaultRuntime.writeJson).toHaveBeenCalledWith(
+      expect.objectContaining({
+        configPath: "/tmp/openclaw.json",
+        approvalsPath: "/tmp/exec-approvals.json",
+        effectivePolicy: expect.objectContaining({
+          scopes: [
+            expect.objectContaining({
+              scopeLabel: "tools.exec",
+              security: expect.objectContaining({
+                requested: "allowlist",
+                host: "allowlist",
+                effective: "allowlist",
+              }),
+              ask: expect.objectContaining({
+                requested: "on-miss",
+                host: "on-miss",
+                effective: "on-miss",
+              }),
+            }),
+          ],
+        }),
+      }),
+      0,
+    );
+  });
+
+  it("applies the yolo preset to both config and approvals", async () => {
+    await runExecPolicyCommand(["exec-policy", "preset", "yolo", "--json"]);
+
+    expect(mocks.getConfig().tools?.exec).toEqual({
+      host: "gateway",
+      security: "full",
+      ask: "off",
+    });
+    expect(mocks.getApprovals().defaults).toEqual({
+      security: "full",
+      ask: "off",
+      askFallback: "full",
+    });
+    expect(mocks.saveExecApprovals).toHaveBeenCalledTimes(1);
+  });
+
+  it("sets explicit values without requiring a preset", async () => {
+    await runExecPolicyCommand([
+      "exec-policy",
+      "set",
+      "--host",
+      "node",
+      "--security",
+      "full",
+      "--ask",
+      "off",
+      "--ask-fallback",
+      "allowlist",
+      "--json",
+    ]);
+
+    expect(mocks.getConfig().tools?.exec).toEqual({
+      host: "node",
+      security: "full",
+      ask: "off",
+    });
+    expect(mocks.getApprovals().defaults).toEqual({
+      security: "full",
+      ask: "off",
+      askFallback: "allowlist",
+    });
+  });
+});
