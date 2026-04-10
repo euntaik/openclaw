@@ -2,6 +2,7 @@ import { Command } from "commander";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
 import type { ExecApprovalsFile } from "../infra/exec-approvals.js";
+import { stripAnsi } from "../terminal/ansi.js";
 import { registerExecPolicyCli } from "./exec-policy-cli.js";
 
 const mocks = vi.hoisted(() => {
@@ -214,5 +215,63 @@ describe("exec-policy CLI", () => {
       ask: "off",
       askFallback: "allowlist",
     });
+  });
+
+  it("sanitizes terminal control content before rendering the text table", async () => {
+    mocks.setConfig({
+      tools: {
+        exec: {
+          host: "auto",
+          security: "allowlist\u001B[31m" as unknown as "allowlist",
+          ask: "on-miss",
+        },
+      },
+    });
+    mocks.readConfigFileSnapshot.mockImplementationOnce(async () => ({
+      path: "/tmp/openclaw.json\u001B[2J",
+      config: mocks.getConfig(),
+    }));
+    mocks.readExecApprovalsSnapshot.mockImplementationOnce(() => ({
+      path: "/tmp/exec-approvals.json\u0007",
+      exists: true,
+      raw: "{}",
+      hash: "approvals-hash",
+      file: {
+        version: 1,
+        defaults: {
+          security: "full",
+          ask: "off",
+          askFallback: "full",
+        },
+        agents: {
+          "scope\u200Bname": {
+            security: "allowlist",
+            ask: "on-miss",
+            askFallback: "deny",
+          },
+        },
+      },
+    }));
+
+    await runExecPolicyCommand(["exec-policy", "show"]);
+
+    const output = stripAnsi(
+      mocks.defaultRuntime.log.mock.calls.map((call) => String(call[0] ?? "")).join("\n"),
+    );
+    expect(output).toContain("/tmp/openclaw.json");
+    expect(output).toContain("/tmp/exec-approvals.json");
+    expect(output).toContain("scope\\u{200B}name");
+    expect(output).not.toContain("\u001B[2J");
+    expect(output).not.toContain("\u0007");
+  });
+
+  it("reports invalid input once and exits once", async () => {
+    await expect(
+      runExecPolicyCommand(["exec-policy", "set", "--security", "nope"]),
+    ).rejects.toThrow("__exit__:1");
+
+    expect(mocks.defaultRuntime.error).toHaveBeenCalledTimes(1);
+    expect(mocks.runtimeErrors).toEqual(["Invalid exec security: nope"]);
+    expect(mocks.defaultRuntime.exit).toHaveBeenCalledTimes(1);
   });
 });

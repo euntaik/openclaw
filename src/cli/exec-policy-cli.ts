@@ -1,6 +1,6 @@
 import type { Command } from "commander";
-import { mutateConfigFile } from "../config/config.js";
-import { readConfigFileSnapshot } from "../config/config.js";
+import { mutateConfigFile, readConfigFileSnapshot } from "../config/config.js";
+import { sanitizeExecApprovalDisplayText } from "../infra/exec-approval-command-display.js";
 import {
   collectExecPolicyScopeSnapshots,
   type ExecPolicyScopeSnapshot,
@@ -18,6 +18,7 @@ import {
 } from "../infra/exec-approvals.js";
 import { defaultRuntime } from "../runtime.js";
 import { formatDocsLink } from "../terminal/links.js";
+import { sanitizeTerminalText } from "../terminal/safe-text.js";
 import { getTerminalTableWidth, renderTable } from "../terminal/table.js";
 import { isRich, theme } from "../terminal/theme.js";
 
@@ -61,10 +62,35 @@ type ExecPolicyShowPayload = {
   };
 };
 
-function exitWithError(message: string): never {
-  defaultRuntime.error(message);
-  defaultRuntime.exit(1);
-  throw new Error(message);
+class ExecPolicyCliError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ExecPolicyCliError";
+  }
+}
+
+function failExecPolicy(message: string): never {
+  throw new ExecPolicyCliError(message);
+}
+
+function formatExecPolicyError(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+async function runExecPolicyAction(action: () => Promise<void>): Promise<void> {
+  try {
+    await action();
+  } catch (err) {
+    defaultRuntime.error(formatExecPolicyError(err));
+    defaultRuntime.exit(1);
+  }
+}
+
+function sanitizeExecPolicyTableCell(value: string): string {
+  return value
+    .split("\n")
+    .map((line) => sanitizeExecApprovalDisplayText(sanitizeTerminalText(line)))
+    .join("\n");
 }
 
 function resolveExecPolicyInput(params: {
@@ -77,28 +103,28 @@ function resolveExecPolicyInput(params: {
   if (params.host !== undefined) {
     const host = normalizeExecTarget(params.host);
     if (!host) {
-      exitWithError(`Invalid exec host: ${params.host}`);
+      failExecPolicy(`Invalid exec host: ${params.host}`);
     }
     resolved.host = host;
   }
   if (params.security !== undefined) {
     const security = normalizeExecSecurity(params.security);
     if (!security) {
-      exitWithError(`Invalid exec security: ${params.security}`);
+      failExecPolicy(`Invalid exec security: ${params.security}`);
     }
     resolved.security = security;
   }
   if (params.ask !== undefined) {
     const ask = normalizeExecAsk(params.ask);
     if (!ask) {
-      exitWithError(`Invalid exec ask mode: ${params.ask}`);
+      failExecPolicy(`Invalid exec ask mode: ${params.ask}`);
     }
     resolved.ask = ask;
   }
   if (params.askFallback !== undefined) {
     const askFallback = normalizeExecSecurity(params.askFallback);
     if (!askFallback) {
-      exitWithError(`Invalid exec askFallback: ${params.askFallback}`);
+      failExecPolicy(`Invalid exec askFallback: ${params.askFallback}`);
     }
     resolved.askFallback = askFallback;
   }
@@ -148,10 +174,8 @@ function applyApprovalsDefaults(
 }
 
 async function buildLocalExecPolicyShowPayload(): Promise<ExecPolicyShowPayload> {
-  const [configSnapshot, approvalsSnapshot] = await Promise.all([
-    readConfigFileSnapshot(),
-    Promise.resolve(readExecApprovalsSnapshot()),
-  ]);
+  const configSnapshot = await readConfigFileSnapshot();
+  const approvalsSnapshot = readExecApprovalsSnapshot();
   return {
     configPath: configSnapshot.path,
     approvalsPath: approvalsSnapshot.path,
@@ -180,9 +204,12 @@ function renderExecPolicyShow(payload: ExecPolicyShowPayload): void {
         { key: "Value", header: "Value", minWidth: 24, flex: true },
       ],
       rows: [
-        { Field: "Config", Value: payload.configPath },
-        { Field: "Approvals", Value: payload.approvalsPath },
-        { Field: "Approvals File", Value: payload.approvalsExists ? "present" : "missing" },
+        { Field: "Config", Value: sanitizeExecPolicyTableCell(payload.configPath) },
+        { Field: "Approvals", Value: sanitizeExecPolicyTableCell(payload.approvalsPath) },
+        {
+          Field: "Approvals File",
+          Value: sanitizeExecPolicyTableCell(payload.approvalsExists ? "present" : "missing"),
+        },
       ],
     }).trimEnd(),
   );
@@ -198,16 +225,20 @@ function renderExecPolicyShow(payload: ExecPolicyShowPayload): void {
         { key: "Effective", header: "Effective", minWidth: 16 },
       ],
       rows: payload.effectivePolicy.scopes.map((scope) => ({
-        Scope: scope.scopeLabel,
-        Requested:
+        Scope: sanitizeExecPolicyTableCell(scope.scopeLabel),
+        Requested: sanitizeExecPolicyTableCell(
           `host=${scope.configPath === "tools.exec" ? "tools.exec.host" : `${scope.configPath}.host`}\n` +
-          `security=${scope.security.requested} (${scope.security.requestedSource})\n` +
-          `ask=${scope.ask.requested} (${scope.ask.requestedSource})`,
-        Host:
+            `security=${scope.security.requested} (${scope.security.requestedSource})\n` +
+            `ask=${scope.ask.requested} (${scope.ask.requestedSource})`,
+        ),
+        Host: sanitizeExecPolicyTableCell(
           `security=${scope.security.host} (${scope.security.hostSource})\n` +
-          `ask=${scope.ask.host} (${scope.ask.hostSource})\n` +
-          `askFallback=${scope.askFallback.effective} (${scope.askFallback.source})`,
-        Effective: `security=${scope.security.effective}\nask=${scope.ask.effective}`,
+            `ask=${scope.ask.host} (${scope.ask.hostSource})\n` +
+            `askFallback=${scope.askFallback.effective} (${scope.askFallback.source})`,
+        ),
+        Effective: sanitizeExecPolicyTableCell(
+          `security=${scope.security.effective}\nask=${scope.ask.effective}`,
+        ),
       })),
     }).trimEnd(),
   );
@@ -242,17 +273,14 @@ export function registerExecPolicyCli(program: Command) {
     .description("Show the local config policy, host approvals, and effective merge")
     .option("--json", "Output as JSON", false)
     .action(async (opts: { json?: boolean }) => {
-      try {
+      await runExecPolicyAction(async () => {
         const payload = await buildLocalExecPolicyShowPayload();
         if (opts.json) {
           defaultRuntime.writeJson(payload, 0);
           return;
         }
         renderExecPolicyShow(payload);
-      } catch (err) {
-        defaultRuntime.error(String(err));
-        defaultRuntime.exit(1);
-      }
+      });
     });
 
   execPolicy
@@ -260,10 +288,10 @@ export function registerExecPolicyCli(program: Command) {
     .description('Apply a synchronized preset: "yolo", "cautious", or "deny-all"')
     .option("--json", "Output as JSON", false)
     .action(async (name: string, opts: { json?: boolean }) => {
-      try {
+      await runExecPolicyAction(async () => {
         const preset = EXEC_POLICY_PRESETS[name as ExecPolicyPresetName];
         if (!preset) {
-          exitWithError(`Unknown exec-policy preset: ${name}`);
+          failExecPolicy(`Unknown exec-policy preset: ${name}`);
         }
         const payload = await applyLocalExecPolicy(preset);
         if (opts.json) {
@@ -273,10 +301,7 @@ export function registerExecPolicyCli(program: Command) {
         defaultRuntime.log(`Applied exec-policy preset: ${name}`);
         defaultRuntime.log("");
         renderExecPolicyShow(payload);
-      } catch (err) {
-        defaultRuntime.error(String(err));
-        defaultRuntime.exit(1);
-      }
+      });
     });
 
   execPolicy
@@ -295,10 +320,10 @@ export function registerExecPolicyCli(program: Command) {
         askFallback?: string;
         json?: boolean;
       }) => {
-        try {
+        await runExecPolicyAction(async () => {
           const policy = resolveExecPolicyInput(opts);
           if (Object.keys(policy).length === 0) {
-            exitWithError("Provide at least one of --host, --security, --ask, or --ask-fallback.");
+            failExecPolicy("Provide at least one of --host, --security, --ask, or --ask-fallback.");
           }
           const payload = await applyLocalExecPolicy(policy);
           if (opts.json) {
@@ -308,10 +333,7 @@ export function registerExecPolicyCli(program: Command) {
           defaultRuntime.log("Synchronized local exec policy.");
           defaultRuntime.log("");
           renderExecPolicyShow(payload);
-        } catch (err) {
-          defaultRuntime.error(String(err));
-          defaultRuntime.exit(1);
-        }
+        });
       },
     );
 }
