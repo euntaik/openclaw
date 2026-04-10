@@ -239,6 +239,24 @@ function mergeLegacyAgent(
 function ensureDir(filePath: string) {
   const dir = path.dirname(filePath);
   fs.mkdirSync(dir, { recursive: true });
+  const dirStat = fs.lstatSync(dir);
+  if (!dirStat.isDirectory() || dirStat.isSymbolicLink()) {
+    throw new Error(`Refusing to use unsafe exec approvals directory: ${dir}`);
+  }
+  return dir;
+}
+
+function assertSafeExecApprovalsDestination(filePath: string): void {
+  try {
+    const stat = fs.lstatSync(filePath);
+    if (stat.isSymbolicLink()) {
+      throw new Error(`Refusing to write exec approvals via symlink: ${filePath}`);
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw err;
+    }
+  }
 }
 
 // Coerce legacy/corrupted allowlists into `ExecAllowlistEntry[]` before we spread
@@ -443,8 +461,20 @@ export function loadExecApprovals(): ExecApprovalsFile {
 
 export function saveExecApprovals(file: ExecApprovalsFile) {
   const filePath = resolveExecApprovalsPath();
-  ensureDir(filePath);
-  fs.writeFileSync(filePath, `${JSON.stringify(file, null, 2)}\n`, { mode: 0o600 });
+  const dir = ensureDir(filePath);
+  assertSafeExecApprovalsDestination(filePath);
+  const tempPath = path.join(dir, `.exec-approvals.${process.pid}.${crypto.randomUUID()}.tmp`);
+  const raw = `${JSON.stringify(file, null, 2)}\n`;
+  let tempWritten = false;
+  try {
+    fs.writeFileSync(tempPath, raw, { mode: 0o600, flag: "wx" });
+    tempWritten = true;
+    fs.renameSync(tempPath, filePath);
+  } finally {
+    if (tempWritten && fs.existsSync(tempPath)) {
+      fs.rmSync(tempPath, { force: true });
+    }
+  }
   try {
     fs.chmodSync(filePath, 0o600);
   } catch {
