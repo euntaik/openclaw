@@ -61,6 +61,15 @@ const mocks = vi.hoisted(() => {
         result: undefined,
       };
     }),
+    replaceConfigFile: vi.fn(async ({ nextConfig }: { nextConfig: OpenClawConfig }) => {
+      configState = structuredClone(nextConfig);
+      return {
+        path: "/tmp/openclaw.json",
+        previousHash: "hash-1",
+        snapshot: { path: "/tmp/openclaw.json" },
+        nextConfig,
+      };
+    }),
     readConfigFileSnapshot: vi.fn(async () => ({
       path: "/tmp/openclaw.json",
       config: configState,
@@ -86,8 +95,8 @@ vi.mock("../config/config.js", async () => {
   const actual = await vi.importActual<typeof import("../config/config.js")>("../config/config.js");
   return {
     ...actual,
-    mutateConfigFile: mocks.mutateConfigFile,
     readConfigFileSnapshot: mocks.readConfigFileSnapshot,
+    replaceConfigFile: mocks.replaceConfigFile,
   };
 });
 
@@ -140,6 +149,7 @@ describe("exec-policy CLI", () => {
     mocks.defaultRuntime.writeJson.mockClear();
     mocks.defaultRuntime.exit.mockClear();
     mocks.mutateConfigFile.mockClear();
+    mocks.replaceConfigFile.mockClear();
     mocks.readConfigFileSnapshot.mockClear();
     mocks.readExecApprovalsSnapshot.mockClear();
     mocks.saveExecApprovals.mockClear();
@@ -188,6 +198,7 @@ describe("exec-policy CLI", () => {
       askFallback: "full",
     });
     expect(mocks.saveExecApprovals).toHaveBeenCalledTimes(1);
+    expect(mocks.replaceConfigFile).toHaveBeenCalledTimes(1);
   });
 
   it("sets explicit values without requiring a preset", async () => {
@@ -195,7 +206,7 @@ describe("exec-policy CLI", () => {
       "exec-policy",
       "set",
       "--host",
-      "node",
+      "gateway",
       "--security",
       "full",
       "--ask",
@@ -206,7 +217,7 @@ describe("exec-policy CLI", () => {
     ]);
 
     expect(mocks.getConfig().tools?.exec).toEqual({
-      host: "node",
+      host: "gateway",
       security: "full",
       ask: "off",
     });
@@ -261,6 +272,9 @@ describe("exec-policy CLI", () => {
     expect(output).toContain("/tmp/openclaw.json");
     expect(output).toContain("/tmp/exec-approvals.json");
     expect(output).toContain("scope\\u{200B}name");
+    expect(output).toContain("host=auto");
+    expect(output).toContain("tools.exec.");
+    expect(output).toContain("host)");
     expect(output).not.toContain("\u001B[2J");
     expect(output).not.toContain("\u0007");
   });
@@ -273,5 +287,33 @@ describe("exec-policy CLI", () => {
     expect(mocks.defaultRuntime.error).toHaveBeenCalledTimes(1);
     expect(mocks.runtimeErrors).toEqual(["Invalid exec security: nope"]);
     expect(mocks.defaultRuntime.exit).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects host=node for the local-only sync path", async () => {
+    await expect(runExecPolicyCommand(["exec-policy", "set", "--host", "node"])).rejects.toThrow(
+      "__exit__:1",
+    );
+
+    expect(mocks.runtimeErrors).toEqual([
+      "Local exec-policy cannot synchronize host=node. Node approvals are fetched from the node at runtime.",
+    ]);
+    expect(mocks.replaceConfigFile).not.toHaveBeenCalled();
+    expect(mocks.saveExecApprovals).not.toHaveBeenCalled();
+  });
+
+  it("rolls back approvals if the config write fails after approvals save", async () => {
+    const originalApprovals = structuredClone(mocks.getApprovals());
+    mocks.replaceConfigFile.mockImplementationOnce(async () => {
+      throw new Error("config write failed");
+    });
+
+    await expect(
+      runExecPolicyCommand(["exec-policy", "set", "--security", "full"]),
+    ).rejects.toThrow("__exit__:1");
+
+    expect(mocks.saveExecApprovals).toHaveBeenCalledTimes(2);
+    expect(mocks.saveExecApprovals.mock.calls[1]?.[0]).toEqual(originalApprovals);
+    expect(mocks.getApprovals()).toEqual(originalApprovals);
+    expect(mocks.runtimeErrors).toEqual(["config write failed"]);
   });
 });
